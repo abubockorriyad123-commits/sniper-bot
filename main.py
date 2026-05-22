@@ -2,186 +2,255 @@ import os
 import time
 import threading
 import logging
-from datetime import datetime, timedelta
+import requests
+import xml.etree.ElementTree as ET
+from datetime import datetime
 
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import yfinance as yf
+import pandas as pd
+from ta.momentum import RSIIndicator
+from ta.trend import EMAIndicator
 from google import genai
 
 # ===================== LOGGING =====================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
+logging.basicConfig(level=logging.INFO)
 
-# ===================== CONFIG (SECURE) =====================
+# ===================== CONFIG =====================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
-    raise Exception("Missing API keys in environment variables!")
+    raise Exception("Missing API keys")
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 client = genai.Client(api_key=GEMINI_API_KEY)
 
 PAIRS = ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'USDCAD']
 
+TRADE_HISTORY = []
 
 # ===================== MARKET DATA =====================
-def get_price(pair):
-    try:
-        ticker = yf.Ticker(f"{pair}=X")
-        data = ticker.history(period="1d", interval="1m")
-        if data.empty:
-            return None
-        return float(data.iloc[-1]['Close'])
-    except Exception as e:
-        logging.error(f"Price fetch error {pair}: {e}")
+def get_data(pair):
+    ticker = yf.Ticker(f"{pair}=X")
+    data = ticker.history(period="2d", interval="5m")
+
+    if data.empty:
         return None
 
+    df = pd.DataFrame(data)
 
-# ===================== AI ANALYSIS =====================
-def analyze_pair(pair, price):
+    df["rsi"] = RSIIndicator(df["Close"], window=14).rsi()
+    df["ema_fast"] = EMAIndicator(df["Close"], window=9).ema_indicator()
+    df["ema_slow"] = EMAIndicator(df["Close"], window=21).ema_indicator()
+
+    latest = df.iloc[-1]
+
+    return {
+        "price": float(latest["Close"]),
+        "rsi": float(latest["rsi"]),
+        "ema_fast": float(latest["ema_fast"]),
+        "ema_slow": float(latest["ema_slow"]),
+        "open": float(df.iloc[-1]["Open"]),
+        "close": float(df.iloc[-1]["Close"])
+    }
+
+# ===================== CANDLE =====================
+def candle_signal(o, c):
+    if c > o:
+        return "BULLISH"
+    elif c < o:
+        return "BEARISH"
+    return "NEUTRAL"
+
+# ===================== FUSION LOGIC =====================
+def fusion(data):
+    if data["rsi"] is None:
+        return None
+
+    candle = candle_signal(data["open"], data["close"])
+
+    if (
+        data["rsi"] < 35 and
+        data["ema_fast"] > data["ema_slow"] and
+        candle == "BULLISH"
+    ):
+        return "UP"
+
+    if (
+        data["rsi"] > 65 and
+        data["ema_fast"] < data["ema_slow"] and
+        candle == "BEARISH"
+    ):
+        return "DOWN"
+
+    return None
+
+# ===================== AI CONFIRM =====================
+def ai_confirm(pair, price, signal):
     prompt = f"""
-You are a short-term forex analysis engine.
+Confirm this trade.
 
 Pair: {pair}
 Price: {price}
+Signal: {signal}
 
-Return ONLY in format:
-Direction|Duration|Reason
-
-Rules:
-- Direction: UP or DOWN
-- Duration: 1 or 2 or 3 (minutes only)
-- No extra text
+Return:
+CONFIRM|reason OR REJECT|reason
 """
 
-    try:
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt
-        )
-
-        text = response.text.strip()
-        parts = text.split("|")
-
-        if len(parts) < 3:
-            return None
-
-        direction = parts[0].strip().upper()
-        duration = int(parts[1].strip())
-        reason = parts[2].strip()
-
-        if direction not in ["UP", "DOWN"]:
-            return None
-        if duration not in [1, 2, 3]:
-            return None
-
-        return direction, duration, reason
-
-    except Exception as e:
-        logging.error(f"AI error: {e}")
-        return None
-
-
-# ===================== RESULT MONITOR =====================
-def monitor_trade(chat_id, pair, direction, entry_price, duration):
-    time.sleep(duration * 60)
-
-    exit_price = get_price(pair)
-    if exit_price is None:
-        bot.send_message(chat_id, "⚠️ Exit price fetch failed.")
-        return
-
-    win = (
-        (direction == "UP" and exit_price > entry_price) or
-        (direction == "DOWN" and exit_price < entry_price)
+    res = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt
     )
 
-    result = "✅ WIN" if win else "❌ LOSS"
+    return res.text.strip()
 
-    msg = f"""
-📊 TRADE RESULT
+# ===================== NEWS =====================
+def get_news():
+    url = "https://news.google.com/rss/search?q=forex+inflation+fed+interest+rate&hl=en-US&gl=US&ceid=US:en"
+    r = requests.get(url)
+    root = ET.fromstring(r.content)
+
+    news = []
+    for item in root.findall(".//item")[:8]:
+        news.append(item.find("title").text)
+
+    return news
+
+def analyze_news(news):
+    keys = ["fed", "interest", "inflation", "cpi", "nfp", "gdp"]
+
+    results = []
+
+    for n in news:
+        impact = "LOW"
+        for k in keys:
+            if k in n.lower():
+                impact = "HIGH"
+                break
+        results.append((n, impact))
+
+    return results
+
+# ===================== TRADE MONITOR =====================
+def monitor(chat_id, pair, direction, entry, duration):
+    time.sleep(duration * 60)
+
+    ticker = yf.Ticker(f"{pair}=X")
+    data = ticker.history(period="1d", interval="1m")
+    exit_price = float(data.iloc[-1]["Close"])
+
+    win = (direction == "UP" and exit_price > entry) or (direction == "DOWN" and exit_price < entry)
+
+    result = "WIN" if win else "LOSS"
+
+    TRADE_HISTORY.append({
+        "pair": pair,
+        "result": result
+    })
+
+    bot.send_message(chat_id, f"""
+📊 RESULT
 
 Pair: {pair}
-Direction: {direction}
-Entry: {entry_price}
+Entry: {entry}
 Exit: {exit_price}
 
 Result: {result}
-"""
-    bot.send_message(chat_id, msg)
+""")
 
-
-# ===================== MAIN ANALYSIS =====================
+# ===================== ANALYSIS =====================
 def run_analysis(chat_id, pair):
-    price = get_price(pair)
+    data = get_data(pair)
 
-    if price is None:
-        bot.send_message(chat_id, "⚠️ Market data unavailable.")
+    if not data:
+        bot.send_message(chat_id, "No data")
         return
 
-    ai_result = analyze_pair(pair, price)
+    signal = fusion(data)
 
-    if not ai_result:
-        bot.send_message(chat_id, "⚠️ AI analysis failed.")
+    if not signal:
+        bot.send_message(chat_id, "❌ No strong setup (filtered)")
         return
 
-    direction, duration, reason = ai_result
+    ai = ai_confirm(pair, data["price"], signal)
 
-    entry_time = (datetime.now() + timedelta(minutes=1)).strftime("%H:%M")
+    if "REJECT" in ai:
+        bot.send_message(chat_id, f"❌ AI rejected\n{ai}")
+        return
 
-    bot.send_message(
-        chat_id,
-        f"""
-🚀 SIGNAL: {pair}
+    bot.send_message(chat_id, f"""
+🚀 SIGNAL
 
-Direction: {direction}
-Duration: {duration} min
-Entry Time: {entry_time}
+Pair: {pair}
+Direction: {signal}
+RSI: {data['rsi']:.2f}
+EMA: {"UP" if data['ema_fast'] > data['ema_slow'] else "DOWN"}
 
-Reason: {reason}
-"""
-    )
+AI: {ai}
+""")
 
     threading.Thread(
-        target=monitor_trade,
-        args=(chat_id, pair, direction, price, duration),
+        target=monitor,
+        args=(chat_id, pair, signal, data["price"], 2),
         daemon=True
     ).start()
 
+# ===================== UI =====================
+def menu():
+    m = InlineKeyboardMarkup(row_width=2)
 
-# ===================== TELEGRAM UI =====================
+    for p in PAIRS:
+        m.add(InlineKeyboardButton(f"📊 {p}", callback_data=p))
+
+    m.add(
+        InlineKeyboardButton("📊 DASHBOARD", callback_data="DASH"),
+        InlineKeyboardButton("📰 NEWS", callback_data="NEWS")
+    )
+
+    return m
+
 @bot.message_handler(commands=['start'])
-def start(message):
-    markup = InlineKeyboardMarkup(row_width=2)
+def start(m):
+    bot.send_message(m.chat.id, "AI Trading Bot", reply_markup=menu())
 
-    buttons = [
-        InlineKeyboardButton(f"📊 {p}", callback_data=p)
-        for p in PAIRS
-    ]
+@bot.callback_query_handler(func=lambda c: True)
+def cb(c):
+    d = c.data
 
-    markup.add(*buttons)
+    if d in PAIRS:
+        threading.Thread(target=run_analysis, args=(c.message.chat.id, d), daemon=True).start()
 
-    bot.send_message(
-        message.chat.id,
-        "⚡ AI Trading Bot Ready\nSelect a pair:",
-        reply_markup=markup
-    )
+    elif d == "DASH":
+        wins = sum(1 for t in TRADE_HISTORY if t["result"] == "WIN")
+        losses = sum(1 for t in TRADE_HISTORY if t["result"] == "LOSS")
 
+        bot.send_message(c.message.chat.id, f"""
+📊 DASHBOARD
 
-@bot.callback_query_handler(func=lambda call: True)
-def callback(call):
-    bot.send_message(call.message.chat.id, f"Analyzing {call.data} ...")
-    threading.Thread(
-        target=run_analysis,
-        args=(call.message.chat.id, call.data),
-        daemon=True
-    ).start()
+Wins: {wins}
+Losses: {losses}
+Total: {len(TRADE_HISTORY)}
+""")
 
+    elif d == "NEWS":
+        news = analyze_news(get_news())
 
-# ===================== START BOT =====================
-logging.info("Bot is running...")
-bot.infinity_polling(timeout=10, long_polling_timeout=5)
+        msg = "📰 NEWS\n\n"
+        high = 0
+
+        for n, i in news:
+            msg += f"{'🔥' if i=='HIGH' else '⚪'} {n}\n"
+            if i == "HIGH":
+                high += 1
+
+        if high > 0:
+            msg += "\n⚠️ HIGH IMPACT NEWS DETECTED"
+
+        bot.send_message(c.message.chat.id, msg)
+
+# ===================== RUN =====================
+logging.info("Bot running...")
+bot.infinity_polling(skip_pending=True)
