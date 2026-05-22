@@ -1,1 +1,4 @@
-# Barut
+# sniper-bot/
+ ├── main.py
+ ├── requirements.txt
+
