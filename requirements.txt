@@ -1,3 +1,6 @@
 pyTelegramBotAPI
 yfinance
 google-genai
+pandas
+ta
+requests
