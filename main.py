@@ -1,272 +1,187 @@
 import os
 import time
 import threading
-import requests
-import pandas as pd
+import logging
+from datetime import datetime, timedelta
+
 import telebot
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+import yfinance as yf
+from google import genai
 
-from http.server import BaseHTTPRequestHandler, HTTPServer
+# ===================== LOGGING =====================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
 
-from ta.momentum import RSIIndicator
-from ta.trend import EMAIndicator, MACD
-
-# =========================
-# CONFIG
-# =========================
-
+# ===================== CONFIG (SECURE) =====================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-API_KEY = os.getenv("TWELVE_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode="Markdown")
+if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
+    raise Exception("Missing API keys in environment variables!")
 
-# =========================
-# 12 PAIRS
-# =========================
+bot = telebot.TeleBot(TELEGRAM_TOKEN)
+client = genai.Client(api_key=GEMINI_API_KEY)
 
-PAIRS = [
-    "EUR/USD", "GBP/USD", "USD/JPY",
-    "AUD/USD", "USD/CHF", "NZD/USD",
-    "EUR/JPY", "GBP/JPY", "EUR/GBP",
-    "AUD/JPY", "CAD/JPY", "GBP/CHF"
-]
+PAIRS = ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'USDCAD']
 
-# =========================
-# KEEP ALIVE SERVER
-# =========================
 
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Bot alive")
-
-def run_server():
-    server = HTTPServer(("0.0.0.0", 8080), Handler)
-    server.serve_forever()
-
-# =========================
-# GET MARKET DATA
-# =========================
-
-def get_data(pair):
-    url = f"https://api.twelvedata.com/time_series?symbol={pair}&interval=1min&outputsize=80&apikey={API_KEY}"
-    res = requests.get(url).json()
-
-    if "values" not in res:
+# ===================== MARKET DATA =====================
+def get_price(pair):
+    try:
+        ticker = yf.Ticker(f"{pair}=X")
+        data = ticker.history(period="1d", interval="1m")
+        if data.empty:
+            return None
+        return float(data.iloc[-1]['Close'])
+    except Exception as e:
+        logging.error(f"Price fetch error {pair}: {e}")
         return None
 
-    df = pd.DataFrame(res["values"])
-    df = df.iloc[::-1]
 
-    for c in ["open", "high", "low", "close"]:
-        df[c] = df[c].astype(float)
-
-    return df
-
-# =========================
-# VOLATILITY FILTER
-# =========================
-
-def volatility(df):
-    return df["high"].iloc[-20:].max() - df["low"].iloc[-20:].min()
-
-def get_active_pairs():
-    scores = []
-
-    for p in PAIRS:
-        df = get_data(p)
-        if df is None:
-            continue
-
-        vol = volatility(df)
-        scores.append((p, vol))
-
-    scores.sort(key=lambda x: x[1], reverse=True)
-
-    return [x[0] for x in scores[:3]]
-
-# =========================
-# NEXT CANDLE PREDICTION
-# =========================
-
-def predict_next_candle(df):
-
-    rsi = RSIIndicator(df["close"]).rsi().iloc[-1]
-
-    ema9 = EMAIndicator(df["close"], 9).ema_indicator().iloc[-1]
-    ema21 = EMAIndicator(df["close"], 21).ema_indicator().iloc[-1]
-
-    macd = MACD(df["close"])
-    macd_val = macd.macd().iloc[-1]
-    macd_sig = macd.macd_signal().iloc[-1]
-
-    up = 0
-    down = 0
-
-    # RSI
-    if rsi < 35:
-        up += 2
-    elif rsi > 65:
-        down += 2
-
-    # EMA
-    if ema9 > ema21:
-        up += 2
-    else:
-        down += 2
-
-    # MACD
-    if macd_val > macd_sig:
-        up += 1
-    else:
-        down += 1
-
-    total = up + down
-
-    up_prob = (up / total) * 100
-    down_prob = (down / total) * 100
-
-    return up_prob, down_prob
-
-# =========================
-# ANALYSIS ENGINE
-# =========================
-
-def analyze(pair):
-
-    df = get_data(pair)
-    if df is None or len(df) < 50:
-        return None
-
-    price = df["close"].iloc[-1]
-
-    rsi = RSIIndicator(df["close"]).rsi().iloc[-1]
-
-    ema9 = EMAIndicator(df["close"], 9).ema_indicator().iloc[-1]
-    ema21 = EMAIndicator(df["close"], 21).ema_indicator().iloc[-1]
-
-    macd = MACD(df["close"])
-    macd_val = macd.macd().iloc[-1]
-    macd_sig = macd.macd_signal().iloc[-1]
-
-    trend_up = ema9 > ema21
-
-    score = 0
-    direction = None
-
-    # RSI
-    if rsi < 35:
-        direction = "UP"
-        score += 30
-    elif rsi > 65:
-        direction = "DOWN"
-        score += 30
-
-    # MACD
-    if direction == "UP" and macd_val > macd_sig:
-        score += 25
-    elif direction == "DOWN" and macd_val < macd_sig:
-        score += 25
-
-    # Trend
-    if direction == "UP" and trend_up:
-        score += 25
-    elif direction == "DOWN" and not trend_up:
-        score += 25
-    else:
-        score += 10
-
-    prob = min(100, score)
-
-    if prob < 80:
-        return {
-            "signal": "NO SIGNAL",
-            "reason": f"Low confidence {prob:.2f}%"
-        }
-
-    up_prob, down_prob = predict_next_candle(df)
-
-    return {
-        "signal": direction,
-        "price": price,
-        "score": score,
-        "probability": prob,
-        "up_prob": up_prob,
-        "down_prob": down_prob
-    }
-
-# =========================
-# AUTO SCAN
-# =========================
-
-def auto_scan():
-
-    active = get_active_pairs()
-
-    best = None
-
-    for p in active:
-
-        r = analyze(p)
-
-        if not r or r["signal"] == "NO SIGNAL":
-            continue
-
-        if best is None or r["probability"] > best[1]["probability"]:
-            best = (p, r)
-
-    return best
-
-# =========================
-# COMMAND
-# =========================
-
-@bot.message_handler(func=lambda m: m.text.lower() == "needsignal")
-def need_signal(msg):
-
-    bot.send_message(msg.chat.id, "🔍 Scanning 12 markets (volatility + candle prediction)...")
-
-    result = auto_scan()
-
-    if not result:
-        bot.send_message(msg.chat.id, "🚫 NO HIGH QUALITY SIGNAL (80%+ not found)")
-        return
-
-    pair, r = result
-
-    bot.send_message(
-        msg.chat.id,
-        f"""
-🚀 *SNIPER SIGNAL (FINAL)*
+# ===================== AI ANALYSIS =====================
+def analyze_pair(pair, price):
+    prompt = f"""
+You are a short-term forex analysis engine.
 
 Pair: {pair}
-Direction: *{r['signal']}*
-Price: `{r['price']}`
+Price: {price}
 
-🎯 Confidence: {r['probability']}%
-📊 Score: {r['score']}/100
+Return ONLY in format:
+Direction|Duration|Reason
 
-📈 Next Candle Prediction:
-UP: {r['up_prob']:.2f}%
-DOWN: {r['down_prob']:.2f}%
+Rules:
+- Direction: UP or DOWN
+- Duration: 1 or 2 or 3 (minutes only)
+- No extra text
+"""
 
-⏱ Duration: 1–2 Minutes
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt
+        )
+
+        text = response.text.strip()
+        parts = text.split("|")
+
+        if len(parts) < 3:
+            return None
+
+        direction = parts[0].strip().upper()
+        duration = int(parts[1].strip())
+        reason = parts[2].strip()
+
+        if direction not in ["UP", "DOWN"]:
+            return None
+        if duration not in [1, 2, 3]:
+            return None
+
+        return direction, duration, reason
+
+    except Exception as e:
+        logging.error(f"AI error: {e}")
+        return None
+
+
+# ===================== RESULT MONITOR =====================
+def monitor_trade(chat_id, pair, direction, entry_price, duration):
+    time.sleep(duration * 60)
+
+    exit_price = get_price(pair)
+    if exit_price is None:
+        bot.send_message(chat_id, "⚠️ Exit price fetch failed.")
+        return
+
+    win = (
+        (direction == "UP" and exit_price > entry_price) or
+        (direction == "DOWN" and exit_price < entry_price)
+    )
+
+    result = "✅ WIN" if win else "❌ LOSS"
+
+    msg = f"""
+📊 TRADE RESULT
+
+Pair: {pair}
+Direction: {direction}
+Entry: {entry_price}
+Exit: {exit_price}
+
+Result: {result}
+"""
+    bot.send_message(chat_id, msg)
+
+
+# ===================== MAIN ANALYSIS =====================
+def run_analysis(chat_id, pair):
+    price = get_price(pair)
+
+    if price is None:
+        bot.send_message(chat_id, "⚠️ Market data unavailable.")
+        return
+
+    ai_result = analyze_pair(pair, price)
+
+    if not ai_result:
+        bot.send_message(chat_id, "⚠️ AI analysis failed.")
+        return
+
+    direction, duration, reason = ai_result
+
+    entry_time = (datetime.now() + timedelta(minutes=1)).strftime("%H:%M")
+
+    bot.send_message(
+        chat_id,
+        f"""
+🚀 SIGNAL: {pair}
+
+Direction: {direction}
+Duration: {duration} min
+Entry Time: {entry_time}
+
+Reason: {reason}
 """
     )
 
-# =========================
-# START
-# =========================
+    threading.Thread(
+        target=monitor_trade,
+        args=(chat_id, pair, direction, price, duration),
+        daemon=True
+    ).start()
 
+
+# ===================== TELEGRAM UI =====================
 @bot.message_handler(commands=['start'])
-def start(msg):
-    bot.send_message(msg.chat.id, "🚀 Bot Ready\nType: needsignal")
+def start(message):
+    markup = InlineKeyboardMarkup(row_width=2)
 
-# =========================
-# RUN
-# =========================
+    buttons = [
+        InlineKeyboardButton(f"📊 {p}", callback_data=p)
+        for p in PAIRS
+    ]
 
-if __name__ == "__main__":
+    markup.add(*buttons)
 
-    threading.Thread(target=run_server).start()
-    bot.infinity_polling(skip_pending=True)
+    bot.send_message(
+        message.chat.id,
+        "⚡ AI Trading Bot Ready\nSelect a pair:",
+        reply_markup=markup
+    )
+
+
+@bot.callback_query_handler(func=lambda call: True)
+def callback(call):
+    bot.send_message(call.message.chat.id, f"Analyzing {call.data} ...")
+    threading.Thread(
+        target=run_analysis,
+        args=(call.message.chat.id, call.data),
+        daemon=True
+    ).start()
+
+
+# ===================== START BOT =====================
+logging.info("Bot is running...")
+bot.infinity_polling(timeout=10, long_polling_timeout=5)
