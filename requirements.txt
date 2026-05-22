@@ -1,0 +1,5 @@
+pyTelegramBotAPI
+pandas
+ta
+requests
+scikit-learn
