@@ -1,5 +1,3 @@
 pyTelegramBotAPI
-pandas
-ta
-requests
-scikit-learn
+yfinance
+google-genai
