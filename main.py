@@ -6,13 +6,12 @@ import pandas as pd
 import telebot
 
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from sklearn.linear_model import LogisticRegression
 
 from ta.momentum import RSIIndicator
 from ta.trend import EMAIndicator, MACD
 
 # =========================
-# ENV
+# CONFIG
 # =========================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -20,9 +19,16 @@ API_KEY = os.getenv("TWELVE_API_KEY")
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode="Markdown")
 
-PAIRS = ["EUR/USD", "GBP/USD", "USD/JPY"]
+# =========================
+# 12 PAIRS
+# =========================
 
-cooldown = {}
+PAIRS = [
+    "EUR/USD", "GBP/USD", "USD/JPY",
+    "AUD/USD", "USD/CHF", "NZD/USD",
+    "EUR/JPY", "GBP/JPY", "EUR/GBP",
+    "AUD/JPY", "CAD/JPY", "GBP/CHF"
+]
 
 # =========================
 # KEEP ALIVE SERVER
@@ -32,18 +38,18 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot is alive")
+        self.wfile.write(b"Bot alive")
 
 def run_server():
     server = HTTPServer(("0.0.0.0", 8080), Handler)
     server.serve_forever()
 
 # =========================
-# MARKET DATA
+# GET MARKET DATA
 # =========================
 
 def get_data(pair):
-    url = f"https://api.twelvedata.com/time_series?symbol={pair}&interval=1min&outputsize=100&apikey={API_KEY}"
+    url = f"https://api.twelvedata.com/time_series?symbol={pair}&interval=1min&outputsize=80&apikey={API_KEY}"
     res = requests.get(url).json()
 
     if "values" not in res:
@@ -52,60 +58,75 @@ def get_data(pair):
     df = pd.DataFrame(res["values"])
     df = df.iloc[::-1]
 
-    for col in ["open", "high", "low", "close"]:
-        df[col] = df[col].astype(float)
+    for c in ["open", "high", "low", "close"]:
+        df[c] = df[c].astype(float)
 
     return df
 
 # =========================
-# LIQUIDITY FILTER
+# VOLATILITY FILTER
 # =========================
 
-def liquidity_check(df):
-    last = df.iloc[-1]
+def volatility(df):
+    return df["high"].iloc[-20:].max() - df["low"].iloc[-20:].min()
 
-    body = abs(last["close"] - last["open"])
-    wick_up = last["high"] - max(last["close"], last["open"])
-    wick_down = min(last["close"], last["open"]) - last["low"]
+def get_active_pairs():
+    scores = []
 
-    if wick_up > body * 2 or wick_down > body * 2:
-        return False
+    for p in PAIRS:
+        df = get_data(p)
+        if df is None:
+            continue
 
-    return True
+        vol = volatility(df)
+        scores.append((p, vol))
 
-# =========================
-# SUPPORT / RESISTANCE
-# =========================
+    scores.sort(key=lambda x: x[1], reverse=True)
 
-def sr_filter(df, price):
-
-    support = df["low"].rolling(20).min().iloc[-1]
-    resistance = df["high"].rolling(20).max().iloc[-1]
-
-    near_support = abs(price - support) < price * 0.0015
-    near_resistance = abs(price - resistance) < price * 0.0015
-
-    return near_support or near_resistance
+    return [x[0] for x in scores[:3]]
 
 # =========================
-# SIMPLE AI MODEL
+# NEXT CANDLE PREDICTION
 # =========================
 
-model = LogisticRegression()
+def predict_next_candle(df):
 
-X_train = [
-    [85, 30, 1, 1],
-    [60, 70, 0, 0],
-    [90, 25, 1, 1],
-    [50, 80, 0, 0],
-]
+    rsi = RSIIndicator(df["close"]).rsi().iloc[-1]
 
-y_train = [1, 0, 1, 0]
+    ema9 = EMAIndicator(df["close"], 9).ema_indicator().iloc[-1]
+    ema21 = EMAIndicator(df["close"], 21).ema_indicator().iloc[-1]
 
-model.fit(X_train, y_train)
+    macd = MACD(df["close"])
+    macd_val = macd.macd().iloc[-1]
+    macd_sig = macd.macd_signal().iloc[-1]
 
-def ai_probability(features):
-    return model.predict_proba([features])[0][1] * 100
+    up = 0
+    down = 0
+
+    # RSI
+    if rsi < 35:
+        up += 2
+    elif rsi > 65:
+        down += 2
+
+    # EMA
+    if ema9 > ema21:
+        up += 2
+    else:
+        down += 2
+
+    # MACD
+    if macd_val > macd_sig:
+        up += 1
+    else:
+        down += 1
+
+    total = up + down
+
+    up_prob = (up / total) * 100
+    down_prob = (down / total) * 100
+
+    return up_prob, down_prob
 
 # =========================
 # ANALYSIS ENGINE
@@ -114,7 +135,7 @@ def ai_probability(features):
 def analyze(pair):
 
     df = get_data(pair)
-    if df is None or len(df) < 60:
+    if df is None or len(df) < 50:
         return None
 
     price = df["close"].iloc[-1]
@@ -130,10 +151,10 @@ def analyze(pair):
 
     trend_up = ema9 > ema21
 
-    direction = None
     score = 0
+    direction = None
 
-    # RSI logic
+    # RSI
     if rsi < 35:
         direction = "UP"
         score += 30
@@ -148,107 +169,104 @@ def analyze(pair):
         score += 25
 
     # Trend
-    if trend_up:
-        score += 20
+    if direction == "UP" and trend_up:
+        score += 25
+    elif direction == "DOWN" and not trend_up:
+        score += 25
     else:
         score += 10
 
-    # Liquidity + SR
-    if liquidity_check(df):
-        score += 10
+    prob = min(100, score)
 
-    if sr_filter(df, price):
-        score += 10
-
-    # AI features
-    features = [score, rsi, int(trend_up), int(macd_val > macd_sig)]
-    prob = ai_probability(features)
-
-    # STRICT 90% FILTER
-    if prob < 90:
+    if prob < 80:
         return {
             "signal": "NO SIGNAL",
             "reason": f"Low confidence {prob:.2f}%"
         }
 
+    up_prob, down_prob = predict_next_candle(df)
+
     return {
         "signal": direction,
         "price": price,
-        "rsi": rsi,
         "score": score,
         "probability": prob,
-        "trend": "UP" if trend_up else "DOWN"
+        "up_prob": up_prob,
+        "down_prob": down_prob
     }
 
 # =========================
-# START COMMAND
+# AUTO SCAN
 # =========================
 
-@bot.message_handler(commands=['start'])
-def start(msg):
+def auto_scan():
 
-    text = """
-🚀 *SNIPER AI FOREX BOT*
+    active = get_active_pairs()
 
-Select a pair:
-"""
+    best = None
 
-    for p in PAIRS:
-        text += f"\n• {p}"
+    for p in active:
 
-    bot.send_message(msg.chat.id, text)
+        r = analyze(p)
+
+        if not r or r["signal"] == "NO SIGNAL":
+            continue
+
+        if best is None or r["probability"] > best[1]["probability"]:
+            best = (p, r)
+
+    return best
 
 # =========================
-# HANDLER
+# COMMAND
 # =========================
 
-@bot.message_handler(func=lambda m: True)
-def handle(msg):
+@bot.message_handler(func=lambda m: m.text.lower() == "needsignal")
+def need_signal(msg):
 
-    pair = msg.text.strip().upper()
+    bot.send_message(msg.chat.id, "🔍 Scanning 12 markets (volatility + candle prediction)...")
 
-    if pair not in PAIRS:
-        bot.send_message(msg.chat.id, "❌ Invalid pair")
+    result = auto_scan()
+
+    if not result:
+        bot.send_message(msg.chat.id, "🚫 NO HIGH QUALITY SIGNAL (80%+ not found)")
         return
 
-    now = time.time()
-
-    if pair in cooldown and now - cooldown[pair] < 60:
-        bot.send_message(msg.chat.id, "⏳ Cooldown active")
-        return
-
-    cooldown[pair] = now
-
-    result = analyze(pair)
-
-    if not result or result["signal"] == "NO SIGNAL":
-        bot.send_message(msg.chat.id, f"🚫 NO SIGNAL\n{result['reason']}")
-        return
+    pair, r = result
 
     bot.send_message(
         msg.chat.id,
         f"""
-🚀 *SNIPER SIGNAL*
+🚀 *SNIPER SIGNAL (FINAL)*
 
 Pair: {pair}
-Direction: *{result['signal']}*
-Price: `{result['price']}`
+Direction: *{r['signal']}*
+Price: `{r['price']}`
 
-🎯 Probability: {result['probability']:.2f}%
-📊 Score: {result['score']}/100
-📈 Trend: {result['trend']}
+🎯 Confidence: {r['probability']}%
+📊 Score: {r['score']}/100
+
+📈 Next Candle Prediction:
+UP: {r['up_prob']:.2f}%
+DOWN: {r['down_prob']:.2f}%
+
+⏱ Duration: 1–2 Minutes
 """
     )
 
 # =========================
-# MAIN RUN
+# START
+# =========================
+
+@bot.message_handler(commands=['start'])
+def start(msg):
+    bot.send_message(msg.chat.id, "🚀 Bot Ready\nType: needsignal")
+
+# =========================
+# RUN
 # =========================
 
 if __name__ == "__main__":
 
     threading.Thread(target=run_server).start()
-    threading.Thread(target=lambda: bot.infinity_polling(skip_pending=True)).start()
-
-    while True:
-        print("💚 Bot alive...")
-        time.sleep(60)
+    bot.infinity_polling(skip_pending=True)
